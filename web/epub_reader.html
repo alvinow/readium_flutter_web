@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+          background: #f5f5f5;
+          overflow: hidden;
+        }
+        #viewer {
+          width: 100%;
+          height: 100vh;
+          background: white;
+          position: relative;
+          z-index: 1;
+        }
+        #controls {
+          position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+          background: rgba(0,0,0,0.85); padding: 12px 24px; border-radius: 12px;
+          display: none; gap: 12px; z-index: 1000; box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        }
+        button {
+          background: #2196f3; color: white; border: none; padding: 10px 20px;
+          border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500;
+        }
+        button:hover { background: #1976d2; }
+        #status {
+          position: fixed; top: 20px; right: 20px;
+          background: rgba(33, 150, 243, 0.95); color: white;
+          padding: 12px 20px; border-radius: 8px; font-size: 13px;
+          max-width: 350px; z-index: 1001; box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+        }
+        .loading {
+          display: flex; flex-direction: column; align-items: center;
+          justify-content: center; height: 100vh; gap: 20px;
+        }
+        .spinner {
+          border: 4px solid #f3f3f3; border-top: 4px solid #2196f3;
+          border-radius: 50%; width: 50px; height: 50px;
+          animation: spin 1s linear infinite;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .welcome {
+          display: flex; flex-direction: column; align-items: center;
+          justify-content: center; height: 100vh; gap: 16px; color: #666;
+        }
+        .welcome-icon { font-size: 80px; }
+    </style>
+</head>
+<body>
+<div id="status">Initializing...</div>
+<div id="viewer">
+    <div class="welcome">
+        <div class="welcome-icon">📚</div>
+        <h2>EPUB Reader Ready</h2>
+        <p>Load an EPUB to begin</p>
+    </div>
+</div>
+<div id="controls">
+    <button onclick="prevPage()">◄ Prev</button>
+    <button onclick="nextPage()">Next ►</button>
+</div>
+
+<!-- Load JSZip first, then EPUB.js -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/epubjs/dist/epub.min.js"></script>
+
+<script>
+    let book = null;
+    let rendition = null;
+
+    function log(msg) {
+      console.log('[EPUB]', msg);
+    }
+
+    function updateStatus(msg) {
+      document.getElementById('status').textContent = msg;
+      log('Status: ' + msg);
+      sendToParent({ type: 'status', message: msg });
+    }
+
+    function sendToParent(data) {
+      try {
+        if (window.parent) window.parent.postMessage(data, '*');
+      } catch (e) { console.error('Send error:', e); }
+    }
+
+    function showControls(show) {
+      document.getElementById('controls').style.display = show ? 'flex' : 'none';
+    }
+
+    // Helper function for byte-range download with progress
+    async function downloadWithRanges(url, onProgress) {
+      const response = await fetch(url, { method: 'HEAD' });
+      const total = parseInt(response.headers.get('content-length'), 10);
+      const supportsRanges = response.headers.get('accept-ranges') === 'bytes';
+
+      log('File size: ' + Math.round(total / 1024) + ' KB');
+      log('Supports byte-ranges: ' + supportsRanges);
+
+      if (!supportsRanges || total < 1024 * 1024) {
+        // Small file or no range support - download normally
+        log('Downloading entire file...');
+        const res = await fetch(url);
+        return await res.blob();
+      }
+
+      // Download in chunks for large files
+      const chunkSize = 512 * 1024; // 512 KB chunks
+      const chunks = [];
+      let downloaded = 0;
+
+      while (downloaded < total) {
+        const start = downloaded;
+        const end = Math.min(downloaded + chunkSize - 1, total - 1);
+
+        const chunkResponse = await fetch(url, {
+          headers: { 'Range': `bytes=${start}-${end}` }
+        });
+
+        const chunk = await chunkResponse.arrayBuffer();
+        chunks.push(chunk);
+        downloaded += chunk.byteLength;
+
+        const percent = Math.round((downloaded / total) * 100);
+        log('Downloaded: ' + percent + '%');
+        if (onProgress) onProgress(percent, downloaded, total);
+      }
+
+      return new Blob(chunks);
+    }
+
+    async function loadEpub(url) {
+      log('Loading: ' + url);
+      updateStatus('Loading EPUB...');
+
+      try {
+        if (rendition) {
+          try { rendition.destroy(); } catch (e) {}
+        }
+
+        let viewer = document.getElementById('viewer');
+        viewer.innerHTML = '<div class="loading"><div class="spinner"></div><p>Downloading EPUB...</p><div id="dl-progress" style="margin-top:10px;font-size:12px;color:#666;"></div></div>';
+
+        // Try byte-range download with progress
+        log('Attempting byte-range download...');
+        const blob = await downloadWithRanges(url, (percent, loaded, total) => {
+          const progressEl = document.getElementById('dl-progress');
+          if (progressEl) {
+            progressEl.textContent = `Downloaded: ${percent}% (${Math.round(loaded/1024)} KB / ${Math.round(total/1024)} KB)`;
+          }
+        });
+
+        const blobUrl = URL.createObjectURL(blob);
+
+        updateStatus('Processing EPUB...');
+        log('Creating book from downloaded blob...');
+        book = ePub(blobUrl, {
+          requestMethod: 'fetch',
+          openAs: 'epub',
+          store: false
+        });
+
+        log('Waiting for ready...');
+
+        // Add timeout wrapper
+        const readyPromise = book.ready;
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Timeout waiting for book.ready')), 30000)
+        );
+
+        await Promise.race([readyPromise, timeoutPromise]);
+        log('Book ready!');
+
+        const metadata = await book.loaded.metadata;
+        log('Metadata: ' + metadata.title);
+        updateStatus('Rendering: ' + metadata.title);
+
+        // IMPORTANT: Clear the viewer before creating rendition
+        viewer.innerHTML = '';
+
+        log('Creating rendition...');
+        rendition = book.renderTo("viewer", {
+          width: "100%",
+          height: "100%",
+          spread: "none",
+          flow: "paginated"
+        });
+
+        log('Displaying first page...');
+        updateStatus('Loading first page...');
+        await rendition.display();
+
+        log('SUCCESS! Book displayed!');
+
+        updateStatus('📖 ' + (metadata.title || 'Ready'));
+        showControls(true);
+        sendToParent({ type: 'ready' });
+
+        // Events
+        let lastLocationUpdate = 0;
+        rendition.on('relocated', (loc) => {
+          // Throttle location updates to avoid spam
+          const now = Date.now();
+          if (now - lastLocationUpdate < 100) return;
+          lastLocationUpdate = now;
+
+          if (book.locations && book.locations.total > 0) {
+            const pct = book.locations.percentageFromCfi(loc.start.cfi);
+            sendToParent({
+              type: 'locationChanged',
+              location: { href: loc.start.href, progression: pct }
+            });
+          }
+        });
+
+        // Background location generation
+        updateStatus('📖 ' + metadata.title + ' (calculating pages...)');
+        book.locations.generate(1024).then(() => {
+          log('Locations generated: ' + book.locations.total);
+          updateStatus('📖 ' + metadata.title);
+        }).catch(e => {
+          log('Location gen failed: ' + e);
+          updateStatus('📖 ' + metadata.title);
+        });
+
+        // Clean up
+        URL.revokeObjectURL(blobUrl);
+
+      } catch (e) {
+        log('ERROR: ' + e.message);
+        log('Stack: ' + e.stack);
+        updateStatus('Error: ' + e.message);
+        let viewer = document.getElementById('viewer');
+        viewer.innerHTML = '<div class="welcome"><div style="font-size: 60px;">⚠️</div><h2>Error Loading EPUB</h2><p>' + e.message + '</p><button onclick="location.reload()" style="margin-top: 20px; padding: 10px 20px; background: #2196f3; color: white; border: none; border-radius: 6px; cursor: pointer;">Retry</button></div>';
+        sendToParent({ type: 'error', message: e.message });
+      }
+    }
+
+    function prevPage() { if (rendition) rendition.prev(); }
+    function nextPage() { if (rendition) rendition.next(); }
+
+    function changeFontSize(size) {
+      if (rendition) {
+        rendition.themes.fontSize(size + 'px');
+        updateStatus('Font: ' + size + 'px');
+      }
+    }
+
+    function changeTheme(theme) {
+      if (rendition) {
+        if (theme === 'dark') {
+          rendition.themes.override('color', '#e0e0e0');
+          rendition.themes.override('background', '#1a1a1a');
+        } else if (theme === 'sepia') {
+          rendition.themes.override('color', '#5b4636');
+          rendition.themes.override('background', '#f4ecd8');
+        } else {
+          rendition.themes.override('color', '#000');
+          rendition.themes.override('background', '#fff');
+        }
+        updateStatus('Theme: ' + theme);
+      }
+    }
+
+    window.addEventListener('message', (e) => {
+      const d = e.data;
+      if (d.action === 'loadEpub') loadEpub(d.url);
+      else if (d.action === 'next') nextPage();
+      else if (d.action === 'prev') prevPage();
+      else if (d.action === 'fontSize') changeFontSize(d.size);
+      else if (d.action === 'theme') changeTheme(d.theme);
+      else if (d.action === 'ping') sendToParent({ type: 'pong' });
+    });
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowLeft') prevPage();
+      if (e.key === 'ArrowRight') nextPage();
+    });
+
+    setTimeout(() => {
+      updateStatus('✓ Ready');
+      sendToParent({ type: 'initialized' });
+    }, 300);
+</script>
+</body>
+</html>
