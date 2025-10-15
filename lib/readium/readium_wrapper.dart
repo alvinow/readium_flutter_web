@@ -42,7 +42,7 @@ class ReadiumLocation {
   factory ReadiumLocation.fromJson(Map<String, dynamic> json) {
     return ReadiumLocation(
       href: json['href'] as String,
-      progression: json['progression'] as double?,
+      progression: (json['progression'] as num?)?.toDouble(),
       position: json['position'] as int?,
       locator: json['locator'] as Map<String, dynamic>?,
     );
@@ -80,9 +80,12 @@ class ReadiumSelection {
 /// Flutter wrapper for Readium HTML Navigator Injectable
 class ReadiumNavigator {
   final html.IFrameElement iframe;
-  final StreamController<ReadiumLocation> _locationController = StreamController<ReadiumLocation>.broadcast();
-  final StreamController<ReadiumSelection> _selectionController = StreamController<ReadiumSelection>.broadcast();
-  final StreamController<String> _errorController = StreamController<String>.broadcast();
+  final StreamController<ReadiumLocation> _locationController =
+  StreamController<ReadiumLocation>.broadcast();
+  final StreamController<ReadiumSelection> _selectionController =
+  StreamController<ReadiumSelection>.broadcast();
+  final StreamController<String> _errorController =
+  StreamController<String>.broadcast();
 
   js.JsObject? _navigatorInstance;
   js.JsObject? _iframeWindow;
@@ -99,6 +102,9 @@ class ReadiumNavigator {
   /// Stream of errors
   Stream<String> get onError => _errorController.stream;
 
+  /// Check if navigator is initialized
+  bool get isInitialized => _isInitialized;
+
   /// Initialize the navigator with configuration
   Future<void> initialize({
     required String navigatorScriptUrl,
@@ -109,8 +115,17 @@ class ReadiumNavigator {
     }
 
     try {
+      print('ReadiumNavigator: Waiting for iframe to load...');
+
       // Wait for iframe to load
-      await iframe.onLoad.first;
+      await iframe.onLoad.first.timeout(
+        const Duration(seconds: 10),
+        onTimeout: () {
+          throw TimeoutException('Iframe load timeout after 10 seconds');
+        },
+      );
+
+      print('ReadiumNavigator: Iframe loaded, accessing window...');
 
       // Get iframe window using JS interop
       _iframeWindow = js.JsObject.fromBrowserObject(iframe)['contentWindow'] as js.JsObject;
@@ -118,8 +133,12 @@ class ReadiumNavigator {
         throw Exception('Could not access iframe content window');
       }
 
+      print('ReadiumNavigator: Got iframe window, accessing document...');
+
       // Get the document from the iframe window
       final iframeDocument = _iframeWindow!['document'] as js.JsObject;
+
+      print('ReadiumNavigator: Creating script element...');
 
       // Create and inject the script element
       final script = iframeDocument.callMethod('createElement', ['script']) as js.JsObject;
@@ -130,38 +149,67 @@ class ReadiumNavigator {
 
       // Set up onload handler
       script['onload'] = js.allowInterop((_) {
+        print('ReadiumNavigator: Script loaded successfully from $navigatorScriptUrl');
         scriptLoaded.complete();
       });
 
       // Set up onerror handler
-      script['onerror'] = js.allowInterop((_) {
-        scriptLoaded.completeError(Exception('Failed to load navigator script'));
+      script['onerror'] = js.allowInterop((error) {
+        print('ReadiumNavigator: Script load error - $error');
+        scriptLoaded.completeError(
+            Exception('Failed to load navigator script from $navigatorScriptUrl')
+        );
       });
+
+      print('ReadiumNavigator: Appending script to document head...');
 
       // Append script to head
       final head = iframeDocument['head'] as js.JsObject;
       head.callMethod('appendChild', [script]);
 
-      await scriptLoaded.future;
+      // Wait for script to load
+      await scriptLoaded.future.timeout(
+        const Duration(seconds: 10),
+        onTimeout: () {
+          throw TimeoutException('Script load timeout after 10 seconds');
+        },
+      );
+
+      print('ReadiumNavigator: Script loaded, waiting for module initialization...');
 
       // Wait a bit for the module to initialize
-      await Future.delayed(const Duration(milliseconds: 100));
+      await Future.delayed(const Duration(milliseconds: 200));
+
+      print('ReadiumNavigator: Checking for ReadiumNavigator in iframe window...');
 
       // Initialize the navigator in the iframe context
       if (_iframeWindow!.hasProperty('ReadiumNavigator')) {
+        print('ReadiumNavigator: Found ReadiumNavigator class, creating instance...');
+
         final navigatorConstructor = _iframeWindow!['ReadiumNavigator'] as js.JsFunction;
         final jsConfig = js.JsObject.jsify(config?.toJson() ?? {});
         _navigatorInstance = js.JsObject(navigatorConstructor, [jsConfig]);
+
+        print('ReadiumNavigator: Instance created, setting up event listeners...');
 
         // Set up event listeners
         _setupEventListeners();
 
         _isInitialized = true;
+        print('ReadiumNavigator: Initialization complete!');
       } else {
-        throw Exception('ReadiumNavigator not found in iframe window. Make sure the script exports it correctly.');
+        print('ReadiumNavigator: ReadiumNavigator class not found in iframe window');
+        print('Available properties: ${_iframeWindow!.toString()}');
+        throw Exception(
+            'ReadiumNavigator not found in iframe window. '
+                'The script may not export it globally, or it may use a different export name.'
+        );
       }
-    } catch (e) {
-      _errorController.add('Initialization error: $e');
+    } catch (e, stackTrace) {
+      final errorMsg = 'Initialization error: $e';
+      print('ReadiumNavigator ERROR: $errorMsg');
+      print('Stack trace: $stackTrace');
+      _errorController.add(errorMsg);
       rethrow;
     }
   }
@@ -170,16 +218,27 @@ class ReadiumNavigator {
   void _setupEventListeners() {
     if (_navigatorInstance == null) return;
 
-    // Location changed event
-    if (_navigatorInstance!.hasProperty('on')) {
+    print('ReadiumNavigator: Setting up event listeners...');
+
+    // Check if the instance has an 'on' method for event listening
+    if (!_navigatorInstance!.hasProperty('on')) {
+      print('ReadiumNavigator: Warning - instance does not have "on" method for events');
+      return;
+    }
+
+    try {
+      // Location changed event
       _navigatorInstance!.callMethod('on', [
         'locationChanged',
         js.allowInterop((dynamic data) {
           try {
+            print('ReadiumNavigator: Location changed event received');
             final jsonData = js_util.dartify(data) as Map<String, dynamic>;
             _locationController.add(ReadiumLocation.fromJson(jsonData));
           } catch (e) {
-            _errorController.add('Error parsing location: $e');
+            final errorMsg = 'Error parsing location: $e';
+            print('ReadiumNavigator: $errorMsg');
+            _errorController.add(errorMsg);
           }
         }),
       ]);
@@ -189,10 +248,13 @@ class ReadiumNavigator {
         'selection',
         js.allowInterop((dynamic data) {
           try {
+            print('ReadiumNavigator: Selection event received');
             final jsonData = js_util.dartify(data) as Map<String, dynamic>;
             _selectionController.add(ReadiumSelection.fromJson(jsonData));
           } catch (e) {
-            _errorController.add('Error parsing selection: $e');
+            final errorMsg = 'Error parsing selection: $e';
+            print('ReadiumNavigator: $errorMsg');
+            _errorController.add(errorMsg);
           }
         }),
       ]);
@@ -201,9 +263,15 @@ class ReadiumNavigator {
       _navigatorInstance!.callMethod('on', [
         'error',
         js.allowInterop((dynamic error) {
-          _errorController.add(error.toString());
+          final errorMsg = error.toString();
+          print('ReadiumNavigator: Error event - $errorMsg');
+          _errorController.add(errorMsg);
         }),
       ]);
+
+      print('ReadiumNavigator: Event listeners configured');
+    } catch (e) {
+      print('ReadiumNavigator: Error setting up event listeners - $e');
     }
   }
 
@@ -211,13 +279,18 @@ class ReadiumNavigator {
   Future<void> loadPublication(String publicationUrl) async {
     _ensureInitialized();
 
+    print('ReadiumNavigator: Loading publication from $publicationUrl');
+
     try {
       final result = _navigatorInstance!.callMethod('loadPublication', [publicationUrl]);
       if (result != null && js_util.hasProperty(result, 'then')) {
         await js_util.promiseToFuture(result);
       }
+      print('ReadiumNavigator: Publication loaded successfully');
     } catch (e) {
-      _errorController.add('Error loading publication: $e');
+      final errorMsg = 'Error loading publication: $e';
+      print('ReadiumNavigator: $errorMsg');
+      _errorController.add(errorMsg);
       rethrow;
     }
   }
@@ -226,14 +299,19 @@ class ReadiumNavigator {
   Future<void> goToLocation(ReadiumLocation location) async {
     _ensureInitialized();
 
+    print('ReadiumNavigator: Going to location ${location.href}');
+
     try {
       final jsLocation = js.JsObject.jsify(location.toJson());
       final result = _navigatorInstance!.callMethod('goTo', [jsLocation]);
       if (result != null && js_util.hasProperty(result, 'then')) {
         await js_util.promiseToFuture(result);
       }
+      print('ReadiumNavigator: Navigation complete');
     } catch (e) {
-      _errorController.add('Error navigating to location: $e');
+      final errorMsg = 'Error navigating to location: $e';
+      print('ReadiumNavigator: $errorMsg');
+      _errorController.add(errorMsg);
       rethrow;
     }
   }
@@ -242,14 +320,20 @@ class ReadiumNavigator {
   Future<bool> goForward() async {
     _ensureInitialized();
 
+    print('ReadiumNavigator: Going forward');
+
     try {
       final result = _navigatorInstance!.callMethod('goForward');
       if (result != null && js_util.hasProperty(result, 'then')) {
-        return await js_util.promiseToFuture<bool>(result);
+        final success = await js_util.promiseToFuture<bool>(result);
+        print('ReadiumNavigator: Go forward ${success ? "successful" : "failed"}');
+        return success;
       }
       return result as bool? ?? false;
     } catch (e) {
-      _errorController.add('Error going forward: $e');
+      final errorMsg = 'Error going forward: $e';
+      print('ReadiumNavigator: $errorMsg');
+      _errorController.add(errorMsg);
       return false;
     }
   }
@@ -258,14 +342,20 @@ class ReadiumNavigator {
   Future<bool> goBackward() async {
     _ensureInitialized();
 
+    print('ReadiumNavigator: Going backward');
+
     try {
       final result = _navigatorInstance!.callMethod('goBackward');
       if (result != null && js_util.hasProperty(result, 'then')) {
-        return await js_util.promiseToFuture<bool>(result);
+        final success = await js_util.promiseToFuture<bool>(result);
+        print('ReadiumNavigator: Go backward ${success ? "successful" : "failed"}');
+        return success;
       }
       return result as bool? ?? false;
     } catch (e) {
-      _errorController.add('Error going backward: $e');
+      final errorMsg = 'Error going backward: $e';
+      print('ReadiumNavigator: $errorMsg');
+      _errorController.add(errorMsg);
       return false;
     }
   }
@@ -273,6 +363,8 @@ class ReadiumNavigator {
   /// Get current location
   Future<ReadiumLocation?> getCurrentLocation() async {
     _ensureInitialized();
+
+    print('ReadiumNavigator: Getting current location');
 
     try {
       final result = _navigatorInstance!.callMethod('getCurrentLocation');
@@ -283,9 +375,16 @@ class ReadiumNavigator {
       }
 
       final jsonData = js_util.dartify(locationData) as Map<String, dynamic>?;
-      return jsonData != null ? ReadiumLocation.fromJson(jsonData) : null;
+      if (jsonData != null) {
+        final location = ReadiumLocation.fromJson(jsonData);
+        print('ReadiumNavigator: Current location - ${location.href}');
+        return location;
+      }
+      return null;
     } catch (e) {
-      _errorController.add('Error getting current location: $e');
+      final errorMsg = 'Error getting current location: $e';
+      print('ReadiumNavigator: $errorMsg');
+      _errorController.add(errorMsg);
       return null;
     }
   }
@@ -294,14 +393,19 @@ class ReadiumNavigator {
   Future<void> updateSettings(Map<String, dynamic> settings) async {
     _ensureInitialized();
 
+    print('ReadiumNavigator: Updating settings - $settings');
+
     try {
       final jsSettings = js.JsObject.jsify(settings);
       final result = _navigatorInstance!.callMethod('updateSettings', [jsSettings]);
       if (result != null && js_util.hasProperty(result, 'then')) {
         await js_util.promiseToFuture(result);
       }
+      print('ReadiumNavigator: Settings updated successfully');
     } catch (e) {
-      _errorController.add('Error updating settings: $e');
+      final errorMsg = 'Error updating settings: $e';
+      print('ReadiumNavigator: $errorMsg');
+      _errorController.add(errorMsg);
       rethrow;
     }
   }
@@ -310,13 +414,18 @@ class ReadiumNavigator {
   Future<void> applyStylesheet(String stylesheetUrl) async {
     _ensureInitialized();
 
+    print('ReadiumNavigator: Applying stylesheet from $stylesheetUrl');
+
     try {
       final result = _navigatorInstance!.callMethod('applyStylesheet', [stylesheetUrl]);
       if (result != null && js_util.hasProperty(result, 'then')) {
         await js_util.promiseToFuture(result);
       }
+      print('ReadiumNavigator: Stylesheet applied successfully');
     } catch (e) {
-      _errorController.add('Error applying stylesheet: $e');
+      final errorMsg = 'Error applying stylesheet: $e';
+      print('ReadiumNavigator: $errorMsg');
+      _errorController.add(errorMsg);
       rethrow;
     }
   }
@@ -324,6 +433,8 @@ class ReadiumNavigator {
   /// Search within the publication
   Future<List<Map<String, dynamic>>> search(String query) async {
     _ensureInitialized();
+
+    print('ReadiumNavigator: Searching for "$query"');
 
     try {
       final result = _navigatorInstance!.callMethod('search', [query]);
@@ -334,9 +445,12 @@ class ReadiumNavigator {
       }
 
       final results = js_util.dartify(searchResults) as List<dynamic>;
+      print('ReadiumNavigator: Search found ${results.length} results');
       return results.cast<Map<String, dynamic>>();
     } catch (e) {
-      _errorController.add('Error searching: $e');
+      final errorMsg = 'Error searching: $e';
+      print('ReadiumNavigator: $errorMsg');
+      _errorController.add(errorMsg);
       return [];
     }
   }
@@ -345,13 +459,23 @@ class ReadiumNavigator {
   dynamic executeScript(String script) {
     _ensureInitialized();
 
+    print('ReadiumNavigator: Executing custom script');
+
     try {
       return _iframeWindow!.callMethod('eval', [script]);
     } catch (e) {
-      _errorController.add('Error executing script: $e');
+      final errorMsg = 'Error executing script: $e';
+      print('ReadiumNavigator: $errorMsg');
+      _errorController.add(errorMsg);
       rethrow;
     }
   }
+
+  /// Get the iframe window object for advanced operations
+  js.JsObject? get iframeWindow => _iframeWindow;
+
+  /// Get the navigator instance for advanced operations
+  js.JsObject? get navigatorInstance => _navigatorInstance;
 
   void _ensureInitialized() {
     if (!_isInitialized || _navigatorInstance == null) {
@@ -361,44 +485,12 @@ class ReadiumNavigator {
 
   /// Dispose of resources
   void dispose() {
+    print('ReadiumNavigator: Disposing resources');
     _locationController.close();
     _selectionController.close();
     _errorController.close();
-  }
-}
-
-/// Factory for creating ReadiumNavigator instances
-class ReadiumNavigatorFactory {
-  /// Create a new navigator with an iframe
-  static Future<ReadiumNavigator> create({
-    required String containerId,
-    required String navigatorScriptUrl,
-    ReadiumNavigatorConfig? config,
-    String? width,
-    String? height,
-  }) async {
-    // Create iframe element
-    final iframe = html.IFrameElement()
-      ..id = '${containerId}_iframe'
-      ..style.width = width ?? '100%'
-      ..style.height = height ?? '100%'
-      ..style.border = 'none';
-
-    // Find container and append iframe
-    final container = html.document.getElementById(containerId);
-    if (container == null) {
-      throw Exception('Container with id $containerId not found');
-    }
-
-    container.append(iframe);
-
-    // Create and initialize navigator
-    final navigator = ReadiumNavigator(iframe);
-    await navigator.initialize(
-      navigatorScriptUrl: navigatorScriptUrl,
-      config: config,
-    );
-
-    return navigator;
+    _isInitialized = false;
+    _navigatorInstance = null;
+    _iframeWindow = null;
   }
 }
